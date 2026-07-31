@@ -9,6 +9,8 @@ import (
 	"github.com/vokix1/spread-terminal/backend/internal/exchanges/binance"
 	"github.com/vokix1/spread-terminal/backend/internal/market"
 	"github.com/vokix1/spread-terminal/backend/internal/services"
+	"github.com/vokix1/spread-terminal/backend/internal/api"
+	
 )
 
 func main() {
@@ -17,7 +19,20 @@ func main() {
 
 	registry := market.NewRegistry()
 
+	bus := market.NewBus()
+
 	binanceClient := binance.New()
+
+	go func(){
+
+	err :=
+	binanceClient.StreamTicker(bus)
+
+	if err!=nil{
+		panic(err)
+	}
+
+}()
 
 	marketService := services.NewMarketService(
 		registry,
@@ -34,6 +49,11 @@ if err != nil {
 
 
 	router := gin.Default()
+
+	api.MarketWS(
+	router,
+	bus,
+)
 
 
 	router.GET("/health", func(c *gin.Context) {
