@@ -26,7 +26,11 @@ func main() {
 
 	// пока discovery пустой,
 	// но архитектура уже готова
-	_ = marketService.Discover(ctx)
+	err := marketService.Discover(ctx)
+
+if err != nil {
+	panic(err)
+}
 
 
 	router := gin.Default()
