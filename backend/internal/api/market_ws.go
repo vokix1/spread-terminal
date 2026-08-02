@@ -29,11 +29,6 @@ func MarketWS(router *gin.Engine, bus *market.Bus) {
 		updates := bus.Subscribe(512)
 		defer bus.Unsubscribe(updates)
 
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := conn.WriteJSON(gin.H{"type": "connected", "subscribers": bus.SubscriberCount()}); err != nil {
-			return
-		}
-
 		for {
 			select {
 			case <-c.Request.Context().Done():
