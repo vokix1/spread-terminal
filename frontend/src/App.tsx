@@ -16,7 +16,7 @@ type RouteType = 'all' | 'spot-spot' | 'spot-future' | 'future-future'
 const API_WS = import.meta.env.VITE_MARKET_WS ?? 'ws://127.0.0.1:8080/ws/market'
 
 function formatNumber(value: number, digits = 4) {
-  return new Intl.NumberFormat('en-US', { maximumFractionDigits: digits }).format(value)
+  return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: digits }).format(value)
 }
 
 function App() {
@@ -39,6 +39,7 @@ function App() {
       socket.onopen = () => setStatus('live')
       socket.onmessage = (message) => {
         const event = JSON.parse(message.data) as MarketEvent
+        if (!event.symbol || !event.bid || !event.ask) return
         setQuotes((current) => ({ ...current, [event.symbol]: event }))
       }
       socket.onerror = () => socket?.close()
@@ -76,76 +77,84 @@ function App() {
   }, [quotes, query, routeType, sortKey])
 
   const selectedQuote = quotes[selected] ?? rows[0]
+  const quoteCount = Object.keys(quotes).length
+  const feedLabel = status === 'offline'
+    ? 'Отключено'
+    : status === 'connecting'
+      ? 'Подключение'
+      : quoteCount > 0
+        ? 'Котировки поступают'
+        : 'Канал подключён, данных пока нет'
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">ST</div>
-          <div><strong>Spread Terminal</strong><span>Market intelligence</span></div>
+          <div><strong>Spread Terminal</strong><span>Аналитика крипторынка</span></div>
         </div>
         <nav>
-          <button className={tab === 'opportunities' ? 'active' : ''} onClick={() => setTab('opportunities')}>Opportunities</button>
-          <button className={tab === 'coin' ? 'active' : ''} onClick={() => setTab('coin')}>Coin analytics</button>
-          <button disabled>Funding scanner</button>
-          <button disabled>Execution</button>
-          <button disabled>System</button>
+          <button className={tab === 'opportunities' ? 'active' : ''} onClick={() => setTab('opportunities')}>Возможности</button>
+          <button className={tab === 'coin' ? 'active' : ''} onClick={() => setTab('coin')}>Аналитика монеты</button>
+          <button disabled>Сканер фандинга</button>
+          <button disabled>Исполнение</button>
+          <button disabled>Система</button>
         </nav>
         <div className="connection-card">
           <span className={`status-dot ${status}`} />
-          <div><strong>{status === 'live' ? 'Live market feed' : status}</strong><span>Binance book ticker</span></div>
+          <div><strong>{feedLabel}</strong><span>Binance: лучшие bid/ask</span></div>
         </div>
       </aside>
 
       <main>
         <header className="topbar">
-          <div><span className="eyebrow">Crypto arbitrage workspace</span><h1>{tab === 'opportunities' ? 'All opportunities' : `${selected.replace('USDT', '')} analytics`}</h1></div>
-          <div className="live-pill"><span className={`status-dot ${status}`} />{Object.keys(quotes).length} live quotes</div>
+          <div><span className="eyebrow">Рабочее пространство криптоарбитража</span><h1>{tab === 'opportunities' ? 'Все возможности' : `Аналитика ${selected.replace('USDT', '')}`}</h1></div>
+          <div className="live-pill"><span className={`status-dot ${status}`} />{quoteCount} котировок</div>
         </header>
 
         {tab === 'opportunities' ? (
           <>
             <section className="metrics">
-              <Metric label="Tracked markets" value={String(Object.keys(quotes).length)} detail="Live top-of-book" />
-              <Metric label="Visible USDT pairs" value={String(rows.length)} detail="Filtered universe" />
-              <Metric label="Best spread" value={rows[0] ? `${rows[0].spread.toFixed(4)}%` : '—'} detail={rows[0]?.symbol ?? 'Waiting for data'} />
-              <Metric label="Feed status" value={status.toUpperCase()} detail={API_WS} />
+              <Metric label="Отслеживаемые рынки" value={String(quoteCount)} detail="Лучшие цены в реальном времени" />
+              <Metric label="Видимые пары USDT" value={String(rows.length)} detail="Отфильтрованный список" />
+              <Metric label="Лучший спред" value={rows[0] ? `${rows[0].spread.toFixed(4)}%` : '—'} detail={rows[0]?.symbol ?? 'Ожидание данных'} />
+              <Metric label="Статус потока" value={quoteCount > 0 ? 'ДАННЫЕ ИДУТ' : status === 'live' ? 'ОЖИДАНИЕ' : status.toUpperCase()} detail={API_WS} />
             </section>
 
             <section className="panel">
               <div className="filters">
-                <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search BTC, ETH, SOL…" />
+                <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Поиск BTC, ETH, SOL…" />
                 <select value={routeType} onChange={(event) => setRouteType(event.target.value as RouteType)}>
-                  <option value="all">All routes</option>
-                  <option value="spot-spot">Spot ↔ Spot</option>
-                  <option value="spot-future" disabled>Spot ↔ Future</option>
-                  <option value="future-future" disabled>Future ↔ Future</option>
+                  <option value="all">Все маршруты</option>
+                  <option value="spot-spot">Спот ↔ Спот</option>
+                  <option value="spot-future" disabled>Спот ↔ Фьючерс</option>
+                  <option value="future-future" disabled>Фьючерс ↔ Фьючерс</option>
                 </select>
                 <select value={sortKey} onChange={(event) => setSortKey(event.target.value as typeof sortKey)}>
-                  <option value="spread">Sort by spread</option>
-                  <option value="liquidity">Sort by top liquidity</option>
-                  <option value="symbol">Sort by symbol</option>
+                  <option value="spread">Сортировать по спреду</option>
+                  <option value="liquidity">Сортировать по ликвидности</option>
+                  <option value="symbol">Сортировать по символу</option>
                 </select>
               </div>
 
               <div className="table-wrap">
                 <table>
-                  <thead><tr><th>Coin</th><th>Route</th><th>Bid</th><th>Ask</th><th>Spread</th><th>Top liquidity</th><th>Updated</th></tr></thead>
+                  <thead><tr><th>Монета</th><th>Маршрут</th><th>Bid</th><th>Ask</th><th>Спред</th><th>Ликвидность на лучших ценах</th><th>Обновлено</th></tr></thead>
                   <tbody>
                     {rows.slice(0, 200).map((row) => (
                       <tr key={row.symbol} onClick={() => { setSelected(row.symbol); setTab('coin') }}>
                         <td><strong>{row.symbol.replace('USDT', '')}</strong><span className="sub">{row.symbol}</span></td>
-                        <td><span className="route-badge">Binance spot</span></td>
+                        <td><span className="route-badge">Binance спот</span></td>
                         <td>{formatNumber(row.bid, 8)}</td>
                         <td>{formatNumber(row.ask, 8)}</td>
                         <td className="positive">{row.spread.toFixed(5)}%</td>
                         <td>${formatNumber(row.liquidity, 0)}</td>
-                        <td>{row.time ? new Date(row.time).toLocaleTimeString() : 'live'}</td>
+                        <td>{row.time ? new Date(row.time).toLocaleTimeString('ru-RU') : 'сейчас'}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
-                {rows.length === 0 && <div className="empty">Waiting for live Binance quotes… Keep the Go backend running on port 8080.</div>}
+                {rows.length === 0 && <div className="empty">{status === 'live' ? 'Соединение с backend установлено, но котировки Binance пока не поступили. Перезапустите backend после обновления ветки.' : 'Нет соединения с backend на порту 8080.'}</div>}
               </div>
             </section>
           </>
@@ -162,7 +171,7 @@ function Metric({ label, value, detail }: { label: string; value: string; detail
 }
 
 function CoinAnalytics({ quote, onBack }: { quote?: MarketEvent; onBack: () => void }) {
-  if (!quote) return <section className="panel empty">No quote selected yet.</section>
+  if (!quote) return <section className="panel empty">Котировка ещё не выбрана.</section>
   const spread = quote.ask > 0 ? ((quote.ask - quote.bid) / quote.ask) * 100 : 0
   const mid = (quote.bid + quote.ask) / 2
   const points = Array.from({ length: 28 }, (_, index) => mid * (1 + Math.sin(index / 3) * 0.0008 + index * 0.00001))
@@ -171,27 +180,27 @@ function CoinAnalytics({ quote, onBack }: { quote?: MarketEvent; onBack: () => v
   const path = points.map((point, index) => `${(index / (points.length - 1)) * 100},${92 - ((point - min) / (max - min || 1)) * 80}`).join(' ')
 
   return <>
-    <button className="back" onClick={onBack}>← Back to opportunities</button>
+    <button className="back" onClick={onBack}>← Назад к возможностям</button>
     <section className="coin-grid">
       <div className="panel chart-panel">
-        <div className="panel-title"><div><span className="eyebrow">Price overview</span><h2>{quote.symbol}</h2></div><strong>${formatNumber(mid, 8)}</strong></div>
+        <div className="panel-title"><div><span className="eyebrow">Обзор цены</span><h2>{quote.symbol}</h2></div><strong>${formatNumber(mid, 8)}</strong></div>
         <svg className="chart" viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points={path} fill="none" stroke="currentColor" strokeWidth="2" vectorEffect="non-scaling-stroke" /></svg>
       </div>
       <div className="panel stats-panel">
-        <h2>Market details</h2>
-        <Detail label="Exchange" value={quote.exchange} />
-        <Detail label="Best bid" value={formatNumber(quote.bid, 8)} />
-        <Detail label="Best ask" value={formatNumber(quote.ask, 8)} />
-        <Detail label="Spread" value={`${spread.toFixed(5)}%`} />
-        <Detail label="Bid quantity" value={formatNumber(quote.bidQty, 6)} />
-        <Detail label="Ask quantity" value={formatNumber(quote.askQty, 6)} />
+        <h2>Параметры рынка</h2>
+        <Detail label="Биржа" value={quote.exchange} />
+        <Detail label="Лучший bid" value={formatNumber(quote.bid, 8)} />
+        <Detail label="Лучший ask" value={formatNumber(quote.ask, 8)} />
+        <Detail label="Спред" value={`${spread.toFixed(5)}%`} />
+        <Detail label="Объём bid" value={formatNumber(quote.bidQty, 6)} />
+        <Detail label="Объём ask" value={formatNumber(quote.askQty, 6)} />
       </div>
     </section>
     <section className="analytics-grid">
-      <AnalyticsCard title="Funding" value="Awaiting futures adapter" detail="Will compare rates across Binance, OKX, Bybit and Hyperliquid." />
-      <AnalyticsCard title="Open interest" value="Awaiting OI feed" detail="Current OI, 1h/24h change and exchange distribution." />
-      <AnalyticsCard title="Basis" value="Awaiting spot-perp routes" detail="Spot/perpetual premium and annualized carry." />
-      <AnalyticsCard title="Executable spread" value={`${spread.toFixed(5)}%`} detail="Currently top-of-book only; depth/VWAP validation comes next." />
+      <AnalyticsCard title="Фандинг" value="Ожидает фьючерсный адаптер" detail="Сравнение ставок Binance, OKX, Bybit и Hyperliquid появится на следующем этапе." />
+      <AnalyticsCard title="Открытый интерес" value="Ожидает поток OI" detail="Текущий OI, изменения за 1 час и 24 часа, распределение по биржам." />
+      <AnalyticsCard title="Базис" value="Ожидает маршруты спот-перпетуал" detail="Премия бессрочного контракта и годовая доходность carry-сделки." />
+      <AnalyticsCard title="Исполнимый спред" value={`${spread.toFixed(5)}%`} detail="Пока используется только лучшая цена. Проверка глубины и VWAP будет добавлена далее." />
     </section>
   </>
 }
