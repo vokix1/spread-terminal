@@ -3,7 +3,6 @@ package phemex
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -20,27 +19,26 @@ const baseURL = "https://api.phemex.com"
 
 type Client struct{ http *http.Client }
 
-func New() *Client { return &Client{http: httpclient.New(20 * time.Second)} }
+func New() *Client { return &Client{http: httpclient.New(30 * time.Second)} }
 func (c *Client) Name() string { return "phemex" }
 
-// ─── FetchInstruments ────────────────────────────────────────────────────────
+type phProduct struct {
+	Symbol          string `json:"symbol"`
+	Type            string `json:"type"`
+	Status          string `json:"status"`
+	BaseCurrency    string `json:"baseCurrency"`
+	QuoteCurrency   string `json:"quoteCurrency"`
+	UnderlyingSymbol string `json:"underlyingSymbol"`
+	ContractType    string `json:"contractType"`
+	SettleCurrency  string `json:"settleCurrency"`
+}
 
 type phProducts struct {
 	Code int `json:"code"`
 	Data struct {
-		Spot []struct {
-			Symbol     string `json:"symbol"`     // "sBTCUSDT"
-			BaseCurrency  string `json:"baseCurrency"`
-			QuoteCurrency string `json:"quoteCurrency"`
-			Status     string `json:"status"` // "Listed"
-		} `json:"spot"`
-		Perpetuals []struct {
-			Symbol         string `json:"symbol"`       // "BTCUSDT"
-			UnderlyingSymbol string `json:"underlyingSymbol"` // ".BTC"
-			QuoteCurrency  string `json:"quoteCurrency"`
-			ContractType   string `json:"contractType"`  // "Linear"
-			Status         string `json:"status"`
-		} `json:"perpProductList"`
+		Products       []phProduct `json:"products"`
+		Perpetuals     []phProduct `json:"perpProductsV2"`
+		LegacyPerpetuals []phProduct `json:"perpProductList"`
 	} `json:"data"`
 }
 
@@ -49,52 +47,70 @@ func (c *Client) FetchInstruments(ctx context.Context) ([]market.Instrument, err
 	if err := c.get(ctx, baseURL+"/public/products", &resp); err != nil {
 		return nil, fmt.Errorf("phemex products: %w", err)
 	}
-	result := make([]market.Instrument, 0)
+	result := make([]market.Instrument, 0, len(resp.Data.Products)+len(resp.Data.Perpetuals))
+	seen := make(map[market.InstrumentKey]struct{})
 
-	for _, s := range resp.Data.Spot {
-		if s.Status != "Listed" || s.QuoteCurrency != "USDT" {
+	for _, p := range resp.Data.Products {
+		if !strings.EqualFold(p.Type, "Spot") || !isActive(p.Status) || p.QuoteCurrency != "USDT" {
 			continue
 		}
-		result = append(result, market.Instrument{
-			Exchange:   "phemex",
-			Symbol:     s.Symbol,
-			Base:       s.BaseCurrency,
-			Quote:      s.QuoteCurrency,
-			MarketType: market.Spot,
-		})
+		base := p.BaseCurrency
+		if base == "" {
+			base = strings.TrimSuffix(strings.TrimPrefix(p.Symbol, "s"), p.QuoteCurrency)
+		}
+		appendInstrument(&result, seen, market.Instrument{Exchange: "phemex", Symbol: p.Symbol, Base: base, Quote: p.QuoteCurrency, MarketType: market.Spot})
 	}
 
-	for _, p := range resp.Data.Perpetuals {
-		if p.Status != "Listed" || p.QuoteCurrency != "USDT" || p.ContractType != "Linear" {
+	perps := append(resp.Data.Perpetuals, resp.Data.LegacyPerpetuals...)
+	for _, p := range perps {
+		quote := p.QuoteCurrency
+		if quote == "" {
+			quote = p.SettleCurrency
+		}
+		if !isActive(p.Status) || quote != "USDT" {
 			continue
 		}
-		// Extract base from underlyingSymbol ".BTC" → "BTC"
-		base := strings.TrimPrefix(p.UnderlyingSymbol, ".")
+		base := p.BaseCurrency
+		if base == "" {
+			base = strings.TrimPrefix(p.UnderlyingSymbol, ".")
+		}
+		if base == "" {
+			base = strings.TrimSuffix(p.Symbol, quote)
+		}
 		if base == "" {
 			continue
 		}
-		result = append(result, market.Instrument{
-			Exchange:   "phemex",
-			Symbol:     p.Symbol,
-			Base:       base,
-			Quote:      p.QuoteCurrency,
-			MarketType: market.Perp,
-		})
+		appendInstrument(&result, seen, market.Instrument{Exchange: "phemex", Symbol: p.Symbol, Base: base, Quote: quote, MarketType: market.Perp})
 	}
 	return result, nil
 }
 
-// ─── FetchSlowData / FetchFastData ───────────────────────────────────────────
-// Phemex /md/v3/ticker/24hr returns all tickers including bid/ask.
+func isActive(status string) bool {
+	status = strings.ToLower(strings.TrimSpace(status))
+	return status != "" && status != "delisted" && status != "closed" && status != "suspended"
+}
+
+func appendInstrument(dst *[]market.Instrument, seen map[market.InstrumentKey]struct{}, inst market.Instrument) {
+	key := market.InstrumentKey{Exchange: inst.Exchange, Symbol: inst.Symbol, MarketType: inst.MarketType}
+	if _, exists := seen[key]; exists {
+		return
+	}
+	seen[key] = struct{}{}
+	*dst = append(*dst, inst)
+}
 
 type phTicker struct {
-	Symbol      string `json:"symbol"`
-	BidPrice    string `json:"bidPrice"`
-	AskPrice    string `json:"askPrice"`
-	Volume      string `json:"volumeEv"` // base volume — use turnover for USDT vol
-	Turnover    string `json:"turnoverEv"`
-	OpenInterest string `json:"openInterest"`
-	FundingRate string `json:"fundingRateEr"` // scaled
+	Symbol       string `json:"symbol"`
+	BidPrice     string `json:"bidPriceRp"`
+	AskPrice     string `json:"askPriceRp"`
+	LegacyBid    string `json:"bidPrice"`
+	LegacyAsk    string `json:"askPrice"`
+	Turnover     string `json:"turnoverRv"`
+	LegacyTurnover string `json:"turnoverEv"`
+	OpenInterest string `json:"openInterestRv"`
+	LegacyOI     string `json:"openInterest"`
+	FundingRate  string `json:"fundingRateRr"`
+	LegacyFunding string `json:"fundingRateEr"`
 }
 
 type phTickerResp struct {
@@ -117,20 +133,19 @@ func (c *Client) FetchSlowData(ctx context.Context, instruments []market.Instrum
 	if err != nil {
 		return fmt.Errorf("phemex tickers: %w", err)
 	}
+	types := instrumentTypes(instruments)
 	now := time.Now()
-	mtype := func(sym string) market.MarketType {
-		// Phemex spot symbols start with 's': "sBTCUSDT"
-		if strings.HasPrefix(sym, "s") {
-			return market.Spot
-		}
-		return market.Perp
-	}
 	for _, t := range tickers {
-		vol, _ := strconv.ParseFloat(t.Turnover, 64)
-		oi, _ := strconv.ParseFloat(t.OpenInterest, 64)
-		fr, _ := strconv.ParseFloat(t.FundingRate, 64)
-		fr = fr / 1e8 // Phemex funding rate is scaled by 1e8
-		mt := mtype(t.Symbol)
+		mt, ok := types[t.Symbol]
+		if !ok {
+			continue
+		}
+		vol := parseFirst(t.Turnover, t.LegacyTurnover)
+		oi := parseFirst(t.OpenInterest, t.LegacyOI)
+		fr := parseFirst(t.FundingRate, t.LegacyFunding)
+		if t.FundingRate == "" && t.LegacyFunding != "" {
+			fr /= 1e8
+		}
 		key := market.InstrumentKey{Exchange: "phemex", Symbol: t.Symbol, MarketType: mt}
 		slow, _ := ca.GetSlow(key)
 		slow.Volume24h = vol
@@ -143,29 +158,47 @@ func (c *Client) FetchSlowData(ctx context.Context, instruments []market.Instrum
 }
 
 func (c *Client) FetchFastData(ctx context.Context, instruments []market.Instrument, ca *cache.Cache) error {
-	symSet := make(map[string]market.MarketType, len(instruments))
-	for _, inst := range instruments {
-		symSet[inst.Symbol] = inst.MarketType
-	}
+	types := instrumentTypes(instruments)
 	tickers, err := c.fetchAllTickers(ctx)
 	if err != nil {
 		return fmt.Errorf("phemex fast tickers: %w", err)
 	}
 	now := time.Now()
 	for _, t := range tickers {
-		mt, ok := symSet[t.Symbol]
+		mt, ok := types[t.Symbol]
 		if !ok {
 			continue
 		}
-		bid, e1 := strconv.ParseFloat(t.BidPrice, 64)
-		ask, e2 := strconv.ParseFloat(t.AskPrice, 64)
-		if e1 != nil || e2 != nil || bid <= 0 || ask <= 0 {
+		bid := parseFirst(t.BidPrice, t.LegacyBid)
+		ask := parseFirst(t.AskPrice, t.LegacyAsk)
+		if bid <= 0 || ask <= 0 {
 			continue
 		}
 		key := market.InstrumentKey{Exchange: "phemex", Symbol: t.Symbol, MarketType: mt}
 		ca.SetFast(key, cache.FastData{Bid: bid, Ask: ask, UpdatedAt: now})
 	}
 	return nil
+}
+
+func instrumentTypes(instruments []market.Instrument) map[string]market.MarketType {
+	result := make(map[string]market.MarketType, len(instruments))
+	for _, inst := range instruments {
+		result[inst.Symbol] = inst.MarketType
+	}
+	return result
+}
+
+func parseFirst(values ...string) float64 {
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		parsed, err := strconv.ParseFloat(value, 64)
+		if err == nil {
+			return parsed
+		}
+	}
+	return 0
 }
 
 func (c *Client) StreamFast(_ context.Context, _ []market.Instrument, _ *cache.Cache) error {
