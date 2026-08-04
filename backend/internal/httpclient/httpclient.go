@@ -1,45 +1,43 @@
 // Package httpclient provides a shared, hardened HTTP client for exchange connectors.
-// It handles:
-//   - Redirects (including HTTP→HTTPS upgrades)
-//   - Compressed responses (gzip)
-//   - Realistic browser-like headers to avoid bot detection
-//   - Per-request context with cancellation
-//   - Automatic retry on EOF / connection-reset (transient errors)
 package httpclient
 
 import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
-// Default is a shared client suitable for all exchange public REST APIs.
-var Default = New(20 * time.Second)
+var Default = New(30 * time.Second)
 
-// New creates a new hardened HTTP client with the given per-request timeout.
 func New(timeout time.Duration) *http.Client {
+	if timeout < 20*time.Second {
+		timeout = 20 * time.Second
+	}
 	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
+			Timeout:   15 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   20 * time.Second,
 		ResponseHeaderTimeout: timeout,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
+		ExpectContinueTimeout: 2 * time.Second,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       90 * time.Second,
-		DisableCompression:    false, // allow gzip
 		ForceAttemptHTTP2:     true,
 	}
 	return &http.Client{
 		Timeout:   timeout,
 		Transport: transport,
-		// Follow redirects, including HTTP→HTTPS upgrade
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) > 10 {
 				return fmt.Errorf("too many redirects")
@@ -49,32 +47,49 @@ func New(timeout time.Duration) *http.Client {
 	}
 }
 
-// GetJSON performs a GET request with retry on transient errors and decodes
-// the JSON response into dst. It adds standard headers that most exchanges expect.
 func GetJSON(ctx context.Context, client *http.Client, url string, dst interface{}) error {
-	const maxRetries = 3
+	return doJSON(ctx, client, http.MethodGet, url, nil, dst)
+}
+
+func PostJSON(ctx context.Context, client *http.Client, url string, body io.Reader, dst interface{}) error {
+	return doJSON(ctx, client, http.MethodPost, url, body, dst)
+}
+
+func doJSON(ctx context.Context, client *http.Client, method, url string, body io.Reader, dst interface{}) error {
+	const maxRetries = 4
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
-			// brief wait between retries
+			delay := time.Duration(1<<uint(attempt-1)) * time.Second
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(attempt) * 800 * time.Millisecond):
+			case <-time.After(delay):
 			}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		var requestBody io.Reader
+		if body != nil {
+			if seeker, ok := body.(io.Seeker); ok {
+				_, _ = seeker.Seek(0, io.SeekStart)
+				requestBody = seeker
+			} else if attempt == 0 {
+				requestBody = body
+			} else {
+				return fmt.Errorf("cannot retry non-seekable request body")
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, method, url, requestBody)
 		if err != nil {
 			return err
 		}
-
-		// Headers that make us look like a real browser/trading tool
 		req.Header.Set("Accept", "application/json, text/plain, */*")
-		req.Header.Set("Accept-Encoding", "gzip, deflate")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; SpreadTerminal/1.0)")
-		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("User-Agent", "SpreadTerminal/1.0")
+		if method == http.MethodPost {
+			req.Header.Set("Content-Type", "application/json")
+		}
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -85,27 +100,34 @@ func GetJSON(ctx context.Context, client *http.Client, url string, dst interface
 			return err
 		}
 
-		body, err := readBody(resp)
-		if err != nil {
-			_ = resp.Body.Close()
-			lastErr = err
-			if isTransient(err) {
+		data, readErr := readBody(resp)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			if isTransient(readErr) {
 				continue
 			}
-			return err
+			return readErr
 		}
-		resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			// 429 or 5xx: retry
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("HTTP %d: %s: %s", resp.StatusCode, url, truncate(data, 256))
 			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-				lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, url)
+				if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+					if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds > 0 {
+						select {
+						case <-ctx.Done():
+							return ctx.Err()
+						case <-time.After(time.Duration(seconds) * time.Second):
+						}
+					}
+				}
 				continue
 			}
-			return fmt.Errorf("HTTP %d: %s", resp.StatusCode, url)
+			return lastErr
 		}
 
-		if err := json.Unmarshal(body, dst); err != nil {
+		if err := json.Unmarshal(data, dst); err != nil {
 			return fmt.Errorf("json decode %s: %w", url, err)
 		}
 		return nil
@@ -115,7 +137,7 @@ func GetJSON(ctx context.Context, client *http.Client, url string, dst interface
 
 func readBody(resp *http.Response) ([]byte, error) {
 	var reader io.Reader = resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
 		gr, err := gzip.NewReader(resp.Body)
 		if err != nil {
 			return nil, err
@@ -123,23 +145,29 @@ func readBody(resp *http.Response) ([]byte, error) {
 		defer gr.Close()
 		reader = gr
 	}
-	return io.ReadAll(io.LimitReader(reader, 32<<20)) // max 32MB
+	return io.ReadAll(io.LimitReader(reader, 32<<20))
 }
 
-// isTransient returns true for errors that are safe to retry.
 func isTransient(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := err.Error()
-	for _, msg := range []string{"EOF", "connection reset", "broken pipe", "i/o timeout", "no such host"} {
-		if len(s) > 0 {
-			for i := 0; i <= len(s)-len(msg); i++ {
-				if s[i:i+len(msg)] == msg {
-					return true
-				}
-			}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, fragment := range []string{"eof", "connection reset", "broken pipe", "tls handshake timeout", "timeout awaiting response headers", "no such host", "server misbehaving"} {
+		if strings.Contains(message, fragment) {
+			return true
 		}
 	}
 	return false
+}
+
+func truncate(data []byte, max int) string {
+	if len(data) <= max {
+		return strings.TrimSpace(string(data))
+	}
+	return strings.TrimSpace(string(data[:max])) + "…"
 }
