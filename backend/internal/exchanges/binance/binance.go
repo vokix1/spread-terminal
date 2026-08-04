@@ -2,12 +2,13 @@ package binance
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/vokix1/spread-terminal/backend/internal/cache"
+	"github.com/vokix1/spread-terminal/backend/internal/httpclient"
 	"github.com/vokix1/spread-terminal/backend/internal/market"
 )
 
@@ -21,14 +22,29 @@ type Client struct {
 }
 
 func New() *Client {
-	return &Client{
-		http: &http.Client{Timeout: 15 * time.Second},
-	}
+	return &Client{http: httpclient.New(20 * time.Second)}
 }
 
 func (c *Client) Name() string { return "binance" }
 
-// ─── FetchInstruments ────────────────────────────────────────────────────────
+type spotExchangeInfo struct {
+	Symbols []struct {
+		Symbol     string `json:"symbol"`
+		BaseAsset  string `json:"baseAsset"`
+		QuoteAsset string `json:"quoteAsset"`
+		Status     string `json:"status"`
+	} `json:"symbols"`
+}
+
+type perpExchangeInfo struct {
+	Symbols []struct {
+		Symbol       string `json:"symbol"`
+		BaseAsset    string `json:"baseAsset"`
+		QuoteAsset   string `json:"quoteAsset"`
+		Status       string `json:"status"`
+		ContractType string `json:"contractType"`
+	} `json:"symbols"`
+}
 
 func (c *Client) FetchInstruments(ctx context.Context) ([]market.Instrument, error) {
 	spot, err := c.fetchSpotInstruments(ctx)
@@ -42,44 +58,19 @@ func (c *Client) FetchInstruments(ctx context.Context) ([]market.Instrument, err
 	return append(spot, perp...), nil
 }
 
-type spotExchangeInfo struct {
-	Symbols []struct {
-		Symbol     string `json:"symbol"`
-		BaseAsset  string `json:"baseAsset"`
-		QuoteAsset string `json:"quoteAsset"`
-		Status     string `json:"status"`
-	} `json:"symbols"`
-}
-
 func (c *Client) fetchSpotInstruments(ctx context.Context) ([]market.Instrument, error) {
 	var data spotExchangeInfo
 	if err := c.get(ctx, restBaseURL+"/api/v3/exchangeInfo", &data); err != nil {
 		return nil, err
 	}
-	result := make([]market.Instrument, 0)
+	result := make([]market.Instrument, 0, len(data.Symbols))
 	for _, s := range data.Symbols {
 		if s.Status != "TRADING" || s.QuoteAsset != "USDT" {
 			continue
 		}
-		result = append(result, market.Instrument{
-			Exchange:   "binance",
-			Symbol:     s.Symbol,
-			Base:       s.BaseAsset,
-			Quote:      s.QuoteAsset,
-			MarketType: market.Spot,
-		})
+		result = append(result, market.Instrument{Exchange: "binance", Symbol: s.Symbol, Base: s.BaseAsset, Quote: s.QuoteAsset, MarketType: market.Spot})
 	}
 	return result, nil
-}
-
-type perpExchangeInfo struct {
-	Symbols []struct {
-		Symbol          string `json:"symbol"`
-		BaseAsset       string `json:"baseAsset"`
-		QuoteAsset      string `json:"quoteAsset"`
-		Status          string `json:"status"`
-		ContractType    string `json:"contractType"`
-	} `json:"symbols"`
 }
 
 func (c *Client) fetchPerpInstruments(ctx context.Context) ([]market.Instrument, error) {
@@ -87,34 +78,36 @@ func (c *Client) fetchPerpInstruments(ctx context.Context) ([]market.Instrument,
 	if err := c.get(ctx, frestBaseURL+"/fapi/v1/exchangeInfo", &data); err != nil {
 		return nil, err
 	}
-	result := make([]market.Instrument, 0)
+	result := make([]market.Instrument, 0, len(data.Symbols))
 	for _, s := range data.Symbols {
 		if s.Status != "TRADING" || s.ContractType != "PERPETUAL" || s.QuoteAsset != "USDT" {
 			continue
 		}
-		result = append(result, market.Instrument{
-			Exchange:   "binance",
-			Symbol:     s.Symbol,
-			Base:       s.BaseAsset,
-			Quote:      s.QuoteAsset,
-			MarketType: market.Perp,
-		})
+		result = append(result, market.Instrument{Exchange: "binance", Symbol: s.Symbol, Base: s.BaseAsset, Quote: s.QuoteAsset, MarketType: market.Perp})
 	}
 	return result, nil
 }
 
-// ─── FetchSlowData ───────────────────────────────────────────────────────────
+type ticker24h struct {
+	Symbol string `json:"symbol"`
+	Volume string `json:"quoteVolume"`
+}
+
+type fundingRate struct {
+	Symbol      string `json:"symbol"`
+	FundingRate string `json:"lastFundingRate"`
+}
+
+type perpTicker struct {
+	Symbol string `json:"symbol"`
+	Volume string `json:"quoteVolume"`
+}
 
 func (c *Client) FetchSlowData(ctx context.Context, instruments []market.Instrument, ca *cache.Cache) error {
 	if err := c.fetchSpotVolumes(ctx, instruments, ca); err != nil {
 		return err
 	}
 	return c.fetchPerpFunding(ctx, instruments, ca)
-}
-
-type ticker24h struct {
-	Symbol string  `json:"symbol"`
-	Volume string  `json:"quoteVolume"` // USDT volume
 }
 
 func (c *Client) fetchSpotVolumes(ctx context.Context, instruments []market.Instrument, ca *cache.Cache) error {
@@ -124,9 +117,7 @@ func (c *Client) fetchSpotVolumes(ctx context.Context, instruments []market.Inst
 	}
 	idx := make(map[string]float64, len(tickers))
 	for _, t := range tickers {
-		var vol float64
-		fmt.Sscanf(t.Volume, "%f", &vol)
-		idx[t.Symbol] = vol
+		idx[t.Symbol], _ = strconv.ParseFloat(t.Volume, 64)
 	}
 	now := time.Now()
 	for _, inst := range instruments {
@@ -142,41 +133,23 @@ func (c *Client) fetchSpotVolumes(ctx context.Context, instruments []market.Inst
 	return nil
 }
 
-type fundingRate struct {
-	Symbol      string `json:"symbol"`
-	FundingRate string `json:"lastFundingRate"`
-}
-
-type perpTicker struct {
-	Symbol   string `json:"symbol"`
-	Volume   string `json:"quoteVolume"`
-	OI       string `json:"openInterest"`
-}
-
 func (c *Client) fetchPerpFunding(ctx context.Context, instruments []market.Instrument, ca *cache.Cache) error {
 	var rates []fundingRate
-	if err := c.get(ctx, frestBaseURL+"/fapi/v1/fundingRate?limit=1", &rates); err != nil {
-		return fmt.Errorf("binance funding: %w", err)
+	if err := c.get(ctx, frestBaseURL+"/fapi/v1/premiumIndex", &rates); err != nil {
+		return fmt.Errorf("binance premium index: %w", err)
 	}
 	fundIdx := make(map[string]float64, len(rates))
 	for _, r := range rates {
-		var f float64
-		fmt.Sscanf(r.FundingRate, "%f", &f)
-		fundIdx[r.Symbol] = f
+		fundIdx[r.Symbol], _ = strconv.ParseFloat(r.FundingRate, 64)
 	}
 
-	var perpTickers []perpTicker
-	if err := c.get(ctx, frestBaseURL+"/fapi/v1/ticker/24hr", &perpTickers); err != nil {
+	var tickers []perpTicker
+	if err := c.get(ctx, frestBaseURL+"/fapi/v1/ticker/24hr", &tickers); err != nil {
 		return fmt.Errorf("binance perp 24hr: %w", err)
 	}
-	volIdx := make(map[string]float64, len(perpTickers))
-	oiIdx := make(map[string]float64, len(perpTickers))
-	for _, t := range perpTickers {
-		var vol, oi float64
-		fmt.Sscanf(t.Volume, "%f", &vol)
-		fmt.Sscanf(t.OI, "%f", &oi)
-		volIdx[t.Symbol] = vol
-		oiIdx[t.Symbol] = oi
+	volIdx := make(map[string]float64, len(tickers))
+	for _, t := range tickers {
+		volIdx[t.Symbol], _ = strconv.ParseFloat(t.Volume, 64)
 	}
 
 	now := time.Now()
@@ -188,14 +161,11 @@ func (c *Client) fetchPerpFunding(ctx context.Context, instruments []market.Inst
 		slow, _ := ca.GetSlow(key)
 		slow.FundingRate = fundIdx[inst.Symbol]
 		slow.Volume24h = volIdx[inst.Symbol]
-		slow.OpenInt = oiIdx[inst.Symbol]
 		slow.UpdatedAt = now
 		ca.SetSlow(key, slow)
 	}
 	return nil
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func (c *Client) get(ctx context.Context, url string, dst interface{}) error {
 	return httpclient.GetJSON(ctx, c.http, url, dst)
