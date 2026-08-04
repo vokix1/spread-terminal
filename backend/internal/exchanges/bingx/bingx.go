@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/vokix1/spread-terminal/backend/internal/cache"
@@ -22,14 +23,36 @@ type Client struct{ http *http.Client }
 func New() *Client { return &Client{http: httpclient.New(20 * time.Second)} }
 func (c *Client) Name() string { return "bingx" }
 
-// ─── FetchInstruments ────────────────────────────────────────────────────────
+type flexibleStatus string
+
+func (s *flexibleStatus) UnmarshalJSON(data []byte) error {
+	var text string
+	if len(data) > 0 && data[0] == '"' {
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+		*s = flexibleStatus(text)
+		return nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(data, &number); err != nil {
+		return err
+	}
+	*s = flexibleStatus(number.String())
+	return nil
+}
+
+func (s flexibleStatus) trading() bool {
+	value := strings.ToUpper(strings.TrimSpace(string(s)))
+	return value == "TRADING" || value == "ONLINE" || value == "1"
+}
 
 type bxSymbolResp struct {
 	Code int `json:"code"`
 	Data struct {
 		Symbols []struct {
-			Symbol     string `json:"symbol"`   // "BTC-USDT"
-			Status     string `json:"status"`   // "TRADING"
+			Symbol string         `json:"symbol"`
+			Status flexibleStatus `json:"status"`
 		} `json:"symbols"`
 	} `json:"data"`
 }
@@ -39,28 +62,19 @@ func (c *Client) FetchInstruments(ctx context.Context) ([]market.Instrument, err
 	if err := c.get(ctx, baseURL+"/openApi/spot/v1/common/symbols", &resp); err != nil {
 		return nil, fmt.Errorf("bingx symbols: %w", err)
 	}
-	result := make([]market.Instrument, 0)
+	result := make([]market.Instrument, 0, len(resp.Data.Symbols))
 	for _, s := range resp.Data.Symbols {
-		if s.Status != "TRADING" {
+		if !s.Status.trading() {
 			continue
 		}
-		// Symbol format: "BTC-USDT"
 		base, quote := splitSymbol(s.Symbol)
 		if quote != "USDT" || base == "" {
 			continue
 		}
-		result = append(result, market.Instrument{
-			Exchange:   "bingx",
-			Symbol:     s.Symbol,
-			Base:       base,
-			Quote:      quote,
-			MarketType: market.Spot,
-		})
+		result = append(result, market.Instrument{Exchange: "bingx", Symbol: s.Symbol, Base: base, Quote: quote, MarketType: market.Spot})
 	}
 	return result, nil
 }
-
-// ─── FetchSlowData ───────────────────────────────────────────────────────────
 
 type bxTickerResp struct {
 	Code int `json:"code"`
@@ -91,24 +105,14 @@ func (c *Client) FetchSlowData(ctx context.Context, instruments []market.Instrum
 	return nil
 }
 
-// ─── FetchFastData ───────────────────────────────────────────────────────────
-
-type bxBookResp struct {
-	Code int `json:"code"`
-	Data struct {
-		Bids [][]string `json:"bids"` // [[price, qty]]
-		Asks [][]string `json:"asks"`
-	} `json:"data"`
-}
-
 type bxAllTickerResp struct {
 	Code int `json:"code"`
 	Data []struct {
-		Symbol    string `json:"symbol"`
-		BidPrice  string `json:"bidPrice"`
-		BidQty    string `json:"bidQty"`
-		AskPrice  string `json:"askPrice"`
-		AskQty    string `json:"askQty"`
+		Symbol   string `json:"symbol"`
+		BidPrice string `json:"bidPrice"`
+		BidQty   string `json:"bidQty"`
+		AskPrice string `json:"askPrice"`
+		AskQty   string `json:"askQty"`
 	} `json:"data"`
 }
 
@@ -154,10 +158,9 @@ func (c *Client) get(ctx context.Context, url string, dst interface{}) error {
 }
 
 func splitSymbol(s string) (base, quote string) {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '-' {
-			return s[:i], s[i+1:]
-		}
+	parts := strings.SplitN(s, "-", 2)
+	if len(parts) != 2 {
+		return s, ""
 	}
-	return s, ""
+	return parts[0], parts[1]
 }
